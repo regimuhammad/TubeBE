@@ -18,33 +18,34 @@ class ArisanGroupController extends Controller
      */
     public function index(Request $request)
     {
-        $perPage = $request->input('per_page', 10);
-        $search = $request->input('search');
+        $userId = $request->user()->id;
 
-        $query = arisan_group::query()->withCount('participants');;
+        $groups = arisan_group::withCount('participants')
+            ->paginate($request->get('per_page', 10));
 
-        if ($search) {
-            $query->where('name', 'like', "%{$search}%");
-        }
-
-        $arisanGroups = $query->paginate($perPage);
+        $groups->getCollection()->transform(function ($group) use ($userId) {
+            $group->joined = $group->participants()
+                ->where('user_id', $userId)
+                ->exists();
+            return $group;
+        });
 
         return response()->json([
-            'status' => 'success',
-            'data' => $arisanGroups->items(),
+            'data' => $groups->items(),
             'meta' => [
-                'current_page' => $arisanGroups->currentPage(),
-                'last_page' => $arisanGroups->lastPage(),
-                'per_page' => $arisanGroups->perPage(),
-                'total' => $arisanGroups->total()
+                'current_page' => $groups->currentPage(),
+                'last_page' => $groups->lastPage(),
+                'total' => $groups->total()
             ]
         ]);
     }
 
 
+
     /**
      * Store a newly created resource in storage.
      */
+    // Laravel Controller
     public function store(Request $request)
     {
         $validator = Validator::make($request->all(), [
@@ -60,7 +61,8 @@ class ArisanGroupController extends Controller
                 'message' => $validator->errors()
             ], 422);
         }
-        
+
+        $user = Auth::user();
 
         $arisanGroups = new arisan_group();
         $arisanGroups->name = $request->name;
@@ -69,14 +71,18 @@ class ArisanGroupController extends Controller
         $arisanGroups->duration = $request->duration;
         $arisanGroups->start_date = $request->start_date;
         $arisanGroups->end_date = $request->end_date;
-        $arisanGroups->user_id = Auth::user()->id;
-        $arisanGroups->current_drawer_user_id = Auth::user()->id;
+        $arisanGroups->user_id = $user->id;
+        $arisanGroups->current_drawer_user_id = $user->id;
+
+        // kontrak belum di-deploy
+        $arisanGroups->contract_address = null;
+
         $arisanGroups->save();
 
         arisan_participant::create([
-        'user_id' => Auth::user()->id,
-        'group_id' => $arisanGroups->id,
-    ]);
+            'user_id' => $user->id,
+            'group_id' => $arisanGroups->id,
+        ]);
 
         return response()->json([
             'status' => 'success',
@@ -84,6 +90,8 @@ class ArisanGroupController extends Controller
             'data' => $arisanGroups
         ], 201);
     }
+
+
 
     public function joinById($groupId, Request $request)
     {
@@ -100,6 +108,27 @@ class ArisanGroupController extends Controller
             ], 409);
         }
 
+        $currentCount = arisan_participant::where('group_id', $group->id)->count();
+
+        if ($currentCount >= 30) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Grup ini sudah mencapai jumlah maksimal 30 anggota.',
+            ], 422);
+        }
+
+        // ⬇️ CEK: apakah sudah pernah draw
+        $hasDrawStarted = DB::table('arisan_draws')
+            ->where('group_id', $group->id)
+            ->exists();
+
+        if ($hasDrawStarted) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Arisan sudah dimulai (sudah ada draw), tidak bisa join lagi.',
+            ], 422);
+        }
+
         arisan_participant::create([
             'user_id' => $request->user()->id,
             'group_id' => $group->id,
@@ -112,6 +141,7 @@ class ArisanGroupController extends Controller
             'group' => $group,
         ]);
     }
+
 
 
     public function saveContractAddress(Request $request, $id)
@@ -241,10 +271,11 @@ class ArisanGroupController extends Controller
                 'arisan_groups.*',
                 'arisan_participants.has_paid as has_paid',
                 'drawer.wallet_address as current_drawer',
-                'participant.wallet_address as user_wallet'
+                'participant.wallet_address as user_wallet',
+                // tambahkan subquery untuk menghitung peserta
+                DB::raw('(SELECT COUNT(*) FROM arisan_participants WHERE group_id = arisan_groups.id) as participants_count')
             )
             ->paginate(10);
-
 
         return response()->json([
             'status' => 'success',
@@ -259,30 +290,64 @@ class ArisanGroupController extends Controller
     }
 
 
-    public function pay($groupId)
+    public function updateContract(Request $request, $id)
+    {
+        $request->validate([
+            'contract_address' => 'required|string'
+        ]);
+
+        $group = arisan_group::findOrFail($id);
+        $group->contract_address = $request->contract_address;
+        $group->save();
+
+        return response()->json([
+            'status' => 'success',
+            'message' => 'Contract address updated',
+            'data' => $group
+        ]);
+    }
+
+
+    public function pay(Request $request, $groupId)
     {
         $userId = auth()->id();
 
+        // ambil participant record
         $participant = DB::table('arisan_participants')
-            ->where('user_id', $userId)
             ->where('group_id', $groupId)
+            ->where('user_id', $userId)
             ->first();
 
         if (!$participant) {
-            return response()->json(['message' => 'Kamu belum join grup ini'], 404);
+            return response()->json(['message' => 'Kamu belum terdaftar di grup ini'], 400);
         }
 
-        if ($participant->has_paid) {
-            return response()->json(['message' => 'Kamu sudah membayar arisan.'], 400);
-        }
-
+        // tandai has_paid
         DB::table('arisan_participants')
-            ->where('user_id', $userId)
-            ->where('group_id', $groupId)
-            ->update(['has_paid' => true]);
+            ->where('id', $participant->id)
+            ->update(['has_paid' => true, 'updated_at' => now()]);
 
-        return response()->json(['message' => 'Pembayaran berhasil']);
+        // ambil ronde saat ini (dari smart contract atau DB)
+        $lastDraw = DB::table('arisan_draws')
+            ->where('group_id', $groupId)
+            ->max('draw_number');
+
+        $currentRound = $lastDraw ? $lastDraw + 1 : 1;
+
+        // masukkan ke tabel arisan_payments
+        DB::table('arisan_payments')->insert([
+            'group_id' => $groupId,
+            'user_id' => $userId,
+            'round' => $currentRound,
+            'amount' => 0.1,
+            'paid_at' => now(),
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+
+        return response()->json(['message' => 'Pembayaran berhasil dicatat']);
     }
+
 
 
     public function recordDraw(Request $request, $groupId)
@@ -310,6 +375,11 @@ class ArisanGroupController extends Controller
             'updated_at' => now(),
         ]);
 
+        // reset semua peserta jadi belum bayar untuk ronde berikutnya
+        DB::table('arisan_participants')
+            ->where('group_id', $groupId)
+            ->update(['has_paid' => 0]);
+
         return response()->json(['message' => 'Hasil draw berhasil dicatat']);
     }
 
@@ -326,7 +396,32 @@ class ArisanGroupController extends Controller
     }
 
 
-    
+    public function updateDrawer(Request $request, $id)
+    {
+        $group = arisan_group::findOrFail($id);
+
+        // Cari peserta berikutnya yang belum menang
+        $participants = arisan_participant::where('group_id', $id)->get();
+
+        if ($participants->isEmpty()) {
+            return response()->json(['message' => 'Tidak ada peserta.'], 400);
+        }
+
+        // urutkan peserta supaya bergilir
+        $currentDrawerId = $group->current_drawer_user_id;
+        $currentIndex = $participants->pluck('user_id')->search($currentDrawerId);
+
+        $nextIndex = ($currentIndex + 1) % $participants->count();
+        $nextDrawerId = $participants[$nextIndex]->user_id;
+
+        $group->current_drawer_user_id = $nextDrawerId;
+        $group->save();
+
+        return response()->json([
+            'message' => 'Drawer updated',
+            'next_drawer_user_id' => $nextDrawerId
+        ]);
+    }
 
 
 

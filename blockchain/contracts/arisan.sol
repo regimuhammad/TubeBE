@@ -9,6 +9,7 @@ contract Arisan {
     mapping(address => bool) public hasWon;
 
     address public lastWinner;
+    address public currentDrawer;
 
     uint public round = 1;
     uint public fee;                 // biaya per peserta
@@ -19,25 +20,24 @@ contract Arisan {
         admin = msg.sender;
         fee = _feeInWei;
         drawInterval = _drawIntervalInSeconds;
-        lastDrawTime = block.timestamp; // mulai dihitung dari deploy
+        lastDrawTime = block.timestamp;
     }
 
-    modifier onlyParticipant() {
-        require(isParticipant(msg.sender), "Kamu belum join arisan");
-        _;
-    }
-
-    function join() public {
-        require(!isParticipant(msg.sender), "Kamu Sudah Join");
-        participants.push(msg.sender);
-    }
-
-    function pay() public payable onlyParticipant {
+    function pay() public payable {
         require(msg.value == fee, "Nominal salah");
+        if (!isParticipant(msg.sender)) {
+            participants.push(msg.sender);
+        }
         hasPaid[msg.sender] = true;
+
+        // Set currentDrawer pertama kali
+        if (currentDrawer == address(0)) {
+            currentDrawer = participants[0];
+        }
     }
 
-    function drawWinner() public onlyParticipant {
+    function drawWinner() public {
+        require(msg.sender == currentDrawer, "Bukan giliran kamu untuk draw");
         require(allPaid(), "Belum semua bayar");
         require(block.timestamp >= lastDrawTime + drawInterval, "Belum waktunya draw");
 
@@ -52,7 +52,6 @@ contract Arisan {
         uint winnerIndex;
         address winner;
 
-        // pilih secara acak yang belum pernah menang
         do {
             winnerIndex = uint(
                 keccak256(abi.encodePacked(block.timestamp, block.prevrandao, round))
@@ -71,8 +70,34 @@ contract Arisan {
             hasPaid[participants[i]] = false;
         }
 
+        // tentukan currentDrawer berikutnya
+        currentDrawer = getNextEligibleDrawer();
+
         round++;
         lastDrawTime = block.timestamp;
+    }
+
+    function getNextEligibleDrawer() internal view returns (address) {
+        if (participants.length == 0) return address(0);
+
+        uint currentIndex = 0;
+        for (uint i = 0; i < participants.length; i++) {
+            if (participants[i] == currentDrawer) {
+                currentIndex = i;
+                break;
+            }
+        }
+
+        // cari berikutnya yang belum menang
+        for (uint offset = 1; offset <= participants.length; offset++) {
+            uint nextIndex = (currentIndex + offset) % participants.length;
+            if (!hasWon[participants[nextIndex]]) {
+                return participants[nextIndex];
+            }
+        }
+
+        // kalau semua sudah menang, return admin saja
+        return admin;
     }
 
     function isParticipant(address user) public view returns (bool) {

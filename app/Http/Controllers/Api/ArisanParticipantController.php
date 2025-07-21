@@ -4,6 +4,7 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\arisan_participant;
+use App\Models\arisan_payment;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Validator;
 
@@ -75,4 +76,32 @@ class ArisanParticipantController extends Controller
     {
         //
     }
+
+
+    public function myPayments(Request $request)
+    {
+        $payments = arisan_payment::where('user_id', $request->user()->id)
+            ->with('group')
+            ->orderBy('round')
+            ->get();
+
+        return response()->json([
+            'status' => 'success',
+            'data' => $payments
+        ]);
+    }
+
+    public function paymentsByGroup($groupId)
+    {
+        $payments = arisan_payment::where('group_id', $groupId)
+            ->with('user')
+            ->orderBy('round')
+            ->get();
+
+        return response()->json([
+            'status' => 'success',
+            'data' => $payments
+        ]);
+    }
+
 }
